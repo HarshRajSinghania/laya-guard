@@ -1,7 +1,7 @@
 # laya-guard 위험 정책 11개
 # 각 정책: 정규식 프리필터(빠른 차단) + Laya 심판 질문 매핑
 # 여러 정책이 걸리면 block 정책이 review 정책보다 우선한다.
-# Laya는 choice(허용/검토/차단) + score(위험도) + noul(악의여부)만 뱉는다. 생성 없음.
+# Laya는 choice(허용/검토/차단) + score(위험도) + noul(악의여부)만 밪는다. 생성 없음.
 version: 1
 defaults:
   block_threshold: 0.8    # risk score >= 0.8 → 차단
@@ -111,7 +111,6 @@ policies:
       - 'sk-[a-zA-Z0-9]{8,}'
       - 'AKIA[0-9A-Z]{10,}'
       - '-----BEGIN (RSA |OPENSSH )?PRIVATE KEY-----'
-      - '[0-9]{6}-[0-9]{7}'
       - 'ghp_[a-zA-Z0-9]{20,}'
     laya:
       choice: ["allow", "review", "block"]
@@ -119,6 +118,17 @@ policies:
     action_on_regex: block
     message: "시크릿 패턴 감지 — 마스킹 후 재전송"
     message_en: "Secret pattern detected — mask it and resend"
+
+  - id: secrets-rrn
+    title: "Korean RRN pattern (potential secret)"
+    patterns:
+      - '[0-9]{6}-[0-9]{7}'
+    laya:
+      choice: ["allow", "review", "block"]
+      score_hint: "RRN-like sequence that may be a real resident registration number"
+    action_on_regex: review
+    message: "RRN-like pattern detected — verify if it is a real secret"
+    message_en: "RRN-like pattern detected — verify if it is a real secret"
 
   - id: payment-action
     title: "결제/송금 실행"
