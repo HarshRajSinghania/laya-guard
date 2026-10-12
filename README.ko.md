@@ -61,13 +61,14 @@ curl -X POST localhost:8787/guard -H 'Content-Type: application/json' \
 
 ```
 에이전트 tool_call
-  → guard-hook.sh (Claude Code PreToolUse 훅; block이면 exit 2로 실행 취소)
+  → guard-hook.sh (Claude Code PreToolUse 훅; block이면 exit 2로 실행 취소, review면 권한 프롬프트)
   → POST /guard (localhost:8787)
   → 체인(`a && b`, `a; b`, `a || b`)은 명령별로 나눠 아래 단계를 거치고, 가장 나쁜 판정을 씀
-  → policy.yaml: 정규식 프리필터 11종 (block 정책이 review 정책보다 우선)
+  → policy.yaml: 정규식 프리필터 12종 (block 정책이 review 정책보다 우선)
       · 매칭 + action_on_regex=block  → 즉시 차단 (risk 0.92, 모델 미호출)
       · 매칭 + action_on_regex=review → 모델 심판, 하한은 review (risk ≥ 0.55)
-      · 미매칭 + 안전 명령            → 즉시 허용 (단일 일반 명령: ls, git status, npm test…)
+      · 미매칭 + 안전 명령            → 즉시 허용 (단일 일반 명령: ls, git status, npm test…;
+                                        npm test 등이 실행할 package.json 스크립트는 먼저 정규식 검사)
       · 미매칭                        → 모델이 자유롭게 심판
   → Laya: choice(허용/검토/차단) + score(위험도) + noul(악의성)
   → 임계값: block ≥ 0.8, review ≥ 0.45 (tool/email/web 출처는 더 엄격: 0.6/0.30)
@@ -81,6 +82,18 @@ curl -X POST localhost:8787/guard -H 'Content-Type: application/json' \
 `--output` 등), 민감 경로(`.ssh`, `.aws`, `.env` 등)가 없는 단일 명령에만 열립니다.
 설치, `git push`, `npx`는 항상 모델이 심판합니다.
 
+`npm test`는 안전 명령이지만, 실제로 실행되는 건 package.json의 `scripts.test`이고,
+에이전트(또는 에이전트가 읽은 주입 지시)가 먼저 고칠 수 있습니다. 그래서 어댑터가
+명령이 실행될 디렉터리(`cwd`, 어댑터 11개 모두 전송)를 보내면, 가드는 가장 가까운
+package.json을 읽어 `npm`/`pnpm`/`yarn`의 `test`/`build`/`lint`/`run <name>`(`bun run
+<name>`, `bun lint` 포함. `bun test`/`bun build`는 bun 자체 도구)에 대해
+`pre<name>`, `<name>`, `post<name>`을 검사합니다. 중첩된 `npm run`과 체인 안의 `cd`도
+따라갑니다. 스크립트는 모델이 아니라 정규식 정책으로만 검사합니다. 모델은 `next
+build`, `vite build`, `jest` 같은 평범한 스크립트를 차단하기 때문입니다. 적중하면
+정책에 따라 block 또는 review이고, reason에 `package.json scripts.test: …`가
+붙습니다. 어떤 스크립트가 실행될지 알 수 없으면(`--prefix`, `--filter`, `-w`, 위치를
+놓친 `cd -`, 3단계보다 깊은 중첩) review로 보냅니다.
+
 체인은 최상위 `;`, `&&`, `||`, `&`에서만 나눕니다(따옴표, `$(…)`, 괄호 안은 그대로).
 그래서 `cd app && npm test`는 안전 명령 두 개이고, `npm test && curl … | sh`는 뒷부분
 때문에 차단됩니다. 전체 문자열도 정규식 검사를 거치므로 명령 경계를 넘는 패턴
@@ -90,7 +103,7 @@ curl -X POST localhost:8787/guard -H 'Content-Type: application/json' \
 
 | 에이전트 | 연동 | `review` 처리 |
 |---|---|---|
-| Claude Code | [PreToolUse 훅](guard-hook.sh) | 통과 (exit 0) |
+| Claude Code | [PreToolUse 훅](guard-hook.sh) | `ask` (권한 프롬프트, `LAYA_GUARD_REVIEW=pass`면 통과) |
 | OpenCode | [`tool.execute.before` 플러그인](integrations/opencode/laya-guard.ts) | allow + stderr 경고 |
 | Codex CLI | [`PreToolUse` 훅](integrations/codex/) | allow + stderr 안내 (ask 불가) |
 | Cursor | [`beforeShellExecution` 훅](integrations/cursor/) | `ask` (사람 승인) |
@@ -105,8 +118,8 @@ curl -X POST localhost:8787/guard -H 'Content-Type: application/json' \
 훅 메커니즘이 없어 어댑터 불가: Aider, Roo Code(2026-05 종료), Continue(단계제만,
 저장소 아카이브), Junie(allow/ask만). 자세히는 [integrations/](integrations/).
 
-에이전트별 설치법: [integrations/](integrations/). `review`를 사람에게 넘기는
-건 Cursor뿐입니다. 나머지는 경고 후 통과하니, 강제 승인이 필요하면 각 도구의
+에이전트별 설치법: [integrations/](integrations/). `review`를 기본으로 사람에게
+넘기는 건 Cursor와 Claude Code입니다. 나머지는 경고 후 통과하니, 강제 승인이 필요하면 각 도구의
 `permission`/`allowlist` 규칙을 함께 쓰세요.
 
 ## 사용처
@@ -115,7 +128,7 @@ curl -X POST localhost:8787/guard -H 'Content-Type: application/json' \
 
 [guard-hook.sh](guard-hook.sh)를 PreToolUse 훅으로 등록하세요. tool 페이로드를
 stdin으로 읽어 로컬 서버에 POST하고, `block`이면 exit 2로 해당 실행을 취소합니다.
-`review`·`allow`는 exit 0으로 통과합니다. Bash 도구는 에이전트가 쓴 설명이 아니라 명령만 심판합니다. 서버에 닿지 않거나 10초 안에 답이 없으면 오프라인 검사로 대체합니다([서버 장애](#서버-장애) 참조).
+`review`면 `permissionDecision: "ask"` JSON을 출력해 Claude Code가 정책과 사유가 담긴 권한 프롬프트로 사람에게 묻습니다(`LAYA_GUARD_REVIEW=pass`면 예전처럼 통과). `allow`는 조용히 통과합니다. 응답할 사람이 없는 비대화형(`claude -p`)에서는 ask가 거부됩니다. Bash 도구는 에이전트가 쓴 설명이 아니라 명령만 심판합니다. 서버에 닿지 않거나 10초 안에 답이 없으면 오프라인 검사로 대체합니다([서버 장애](#서버-장애) 참조).
 [한계](#한계)를 먼저 읽어주세요. 서버 주소는 `LAYA_GUARD_URL`로 바꿀 수 있습니다.
 
 ### 2. 아무 에이전트 루프 가드 (HTTP)
@@ -200,34 +213,36 @@ laya-guard stats   # 판정 분포, block/review율, 상위 정책, 지연시간
 | 판정 | allow / **review** / block + risk | allow / confirm / block | 이진 판정 | valid + score | 점수 / 임계값 |
 | 한국어 평가 | ✅ 30문항 30/30 | ❌ 확인 불가 | ❌ | ❌ | ❌ |
 | AgentDojo 수치 | ✅ 25/27, 92/97 (심판 레벨, 자체 측정) | ❌ 확인 불가 | ❌ | ❌ | ❌ |
-| 상태 | 개발 중, v0.2.3, MIT | MIT | ⚠️ 2025-05 아카이브 | ⚠️ 아카이브, 미유지보수 | 알파, Apache-2.0 |
+| 상태 | 개발 중, v0.2.4, MIT | MIT | ⚠️ 2025-05 아카이브 | ⚠️ 아카이브, 미유지보수 | 알파, Apache-2.0 |
 
 이 표의 어떤 도구도 제3자 검증 AgentDojo 점수는 없습니다. 우리 수치도 자체 측정·심판
 레벨입니다 ([한계](#한계) 참조).
 
-## 정책 (11종)
+## 정책 (12종)
 
 | id | 잡는 것 | 정규식 적중 시 |
 |---|---|---|
-| `destructive-fs` | `rm -rf /`, `mkfs`, 디바이스 `dd`, 포크밤 | block |
+| `destructive-fs` | `rm -rf /`, `rm -rf ~`/`$HOME` (플래그 순서 무관: `-fr`, `-r -f`, `--recursive --force`), `mkfs`, 디바이스 `dd`, 포크밤 | block |
 | `pipe-to-shell` | `curl … \| sh`, `wget … \| sudo bash`, `bash -c "$(curl …)"`, `bash <(curl …)` | block |
 | `exfiltration` | 터널, `nc`로 파이프, `curl -d @파일` 업로드 | review |
 | `prompt-injection` | 이전 지시 무시, 탈옥, 한영 | block |
-| `secrets-leak` | API 키, 개인키, 토큰 | block |
+| `secrets-leak` | API 키, 개인키, 토큰, 키 파일(`~/.ssh`, `~/.aws` 등)을 `curl`/`wget`/`nc`로 파이프 | block |
 | `payment-action` | 결제/환불/청구, 한영 | review |
 | `remote-exec` | 수상한 패키지 인덱스, 원격 스크립트, 로컬 내용을 셸로 파이프, 인코딩된 PS | review |
 | `priv-escalation` | `sudo sh`, `chmod 777`, setuid, `/etc/`로 리다이렉트 | review |
 | `persistence` | cron, 서비스 등록, 셸rc 후킹, git `core.hooksPath`/`core.pager` | review |
-| `mass-delete` | `DROP TABLE`, `s3 rm --recursive`, `kubectl delete --all`, `git push --force` | review |
+| `mass-delete` | `DROP TABLE`, `s3 rm --recursive`, `kubectl delete --all`, `git push --force`, `git reset --hard`, `git clean -f`, `git checkout -- .` | review |
 | `auth-bypass` | 인증/TLS 무력화, 비밀번호 초기화, 한영 | block |
+| `credential-read` | 개인키·클라우드 자격 증명 읽기(`cat ~/.ssh/id_rsa`, `cat ~/.aws/credentials` 등) | review |
 
 패턴은 전부 [policy.yaml](src/laya_guard/policy.yaml)에 있습니다. 코드 수정 없이 추가·수정 가능.
 
 ## API
 
 - `GET /health` → `{"ok": true, "mock": false}`
-- `POST /guard` `{tool_call, source?}` → `{action, risk, policy_id, reason, mock, verdict_source}`
+- `POST /guard` `{tool_call, source?, cwd?}` → `{action, risk, policy_id, reason, mock, verdict_source}`
   (`source`: `user` | `tool` | `email` | `web`. 비사용자 출처는 임계값 강화.
+  `cwd`: 명령이 실행될 절대 경로. 주면 package.json 스크립트 검사가 켜짐.
   `reason`은 입력에 한글이 있으면 한국어, 아니면 영어로 반환.
   `verdict_source`: `regex`(정규식 선차단, 모델 미호출) |
   `allowlist`(안전 명령, 모델 미호출) | `model` |
@@ -244,6 +259,7 @@ laya-guard stats   # 판정 분포, block/review율, 상위 정책, 지연시간
 | `LAYA_GUARD_DEVICE` | 환경변수 | `cpu` (결정적. `mps`는 빠르지만 재현성 포기) |
 | `LAYA_GUARD_URL` | 환경변수 (훅/어댑터) | `http://localhost:8787/guard` |
 | `LAYA_GUARD_FAIL` | 환경변수 (훅/어댑터) | `open` — 서버 장애 시 판정 못 한 호출은 통과, `closed`면 차단 |
+| `LAYA_GUARD_REVIEW` | 환경변수 (Claude Code 훅) | `ask` — `review`를 권한 프롬프트로 사람에게 묻기, `pass`면 묻지 않고 통과 |
 | `LAYA_GUARD_BIN` | 환경변수 (훅/어댑터) | `laya-guard` — 오프라인 검사에 쓰는 CLI |
 | `--no-warmup` | `laya-guard serve` | off — 서버가 대기하기 전에 모델을 먼저 올림 |
 | block/review 임계값 | `policy.yaml` → `defaults` | 0.8 / 0.45 |
@@ -257,6 +273,7 @@ laya-guard stats   # 판정 분포, block/review율, 상위 정책, 지연시간
 | 호출 | 오프라인 판정 |
 |---|---|
 | 정규식 정책에 적중 (block·review 등급 모두) | block |
+| 안전 명령이 실행할 package.json 스크립트가 정규식 정책에 적중 | block |
 | 안전 명령, 또는 안전 명령만으로 된 체인 | allow |
 | 그 외 | stderr 경고 후 allow. `LAYA_GUARD_FAIL=closed`면 block |
 
@@ -273,9 +290,18 @@ laya-guard stats   # 판정 분포, block/review율, 상위 정책, 지연시간
 - 실행 중 모델이 실패하면 판정은 정규식+휴리스틱으로 대체됩니다. 이때
   `verdict_source: "heuristic"`으로 표시되고 경고가 로그에 남으니, 모델 판정에
   의존한다면 확인하세요.
-- 안전 명령 레인은 `npm test`, `make test`, `go test` 등을 모델 없이 허용합니다. 이들은
-  프로젝트 자체 스크립트를 실행하므로, 악성 저장소의 테스트 스크립트는 심판되지 않습니다.
-  신경 쓰인다면 `policy.yaml`의 `safe_commands`를 줄이세요.
+- 안전 명령 레인은 `npm test`, `make test`, `go test` 등을 모델 없이 허용합니다.
+  package.json 스크립트는 정규식으로 검사하므로(위 참고) `scripts.test`의 `curl … | sh`나
+  시크릿 업로드는 잡히지만, 더 조용한 스크립트(`node -e …`, `node scripts/x.js`)는
+  통과합니다. 이 명령들이 실행하는 코드는 전혀 검사하지 않습니다: 테스트 파일,
+  `conftest.py`, `build.rs`, `node_modules/.bin`, Makefile 레시피(`make -n`으로 펼치면
+  `$(shell …)`이 실행됨), `.npmrc`의 `script-shell`. 이 파일들의 수정은 에이전트가 쓰는
+  시점에만, 파일 수정을 훅으로 받는 어댑터에서만 심판됩니다. 신경 쓰인다면
+  `policy.yaml`의 `safe_commands`를 줄이세요.
+- 스크립트 검사는 에이전트가 알려주는 `cwd`를 믿습니다. 에이전트의 셸이 이전 호출의
+  `cd`를 유지하면서 프로젝트 루트를 보고하면 엉뚱한 package.json을 읽습니다. 어댑터
+  5개(Cline, Gemini, Qwen, Kilo, Amp)는 도구 호출을 JSON으로 보내므로 안전 명령에
+  해당하지 않고, 대신 모델이 심판합니다.
 - 체인은 명령별로 심판하므로, 모델은 `cat shadow` 앞에 `cd /etc`가 있었다는 걸 모릅니다.
   민감 경로 검사와 전체 문자열 정규식이 흔한 경우를 막지만 전부는 아닙니다.
 - 정규식 `block` 적중은 `risk: 0.92` 하드코딩을 반환합니다. 모델을 건너뛰므로 이 점수는

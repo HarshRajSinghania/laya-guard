@@ -20,6 +20,18 @@ laya-guard check --json "<the exact command>"
 
 Every confirmed case becomes a row in an eval set so it can't regress.
 
+## Picking up an issue
+
+Comment `/assign` on an issue to take it; a bot assigns it to you and reacts
+with 👍. It only works on open, unassigned issues (look for
+[`good first issue`](https://github.com/scs0209/laya-guard/labels/good%20first%20issue)
+and [`help wanted`](https://github.com/scs0209/laya-guard/labels/help%20wanted)).
+Comment `/unassign` if you can't continue. If an assigned issue sees no
+activity for two weeks, a maintainer may unassign it so someone else can
+pick it up.
+
+Small fixes don't need an issue first; open the PR directly.
+
 ## Development setup
 
 ```bash
@@ -36,6 +48,9 @@ export LAYA_GUARD_MOCK=1 PYTHONPATH=src
 ```
 
 ## Gates (CI runs these on Python 3.10 to 3.13)
+
+CI on PRs from outside contributors starts after a maintainer approves the run.
+CodeRabbit also posts an automated review; a maintainer still reviews every PR.
 
 ```bash
 python -m pytest tests/ -q
@@ -70,4 +85,40 @@ PYTHONPATH=src .venv/bin/python eval/run_agentdojo.py     # needs: pip install a
   `LAYA_GUARD_BIN` support, and a contract test in `tests/test_integrations.py`.
 - Keep PRs small and focused. Add a line under `## [Unreleased]` in
   [CHANGELOG.md](CHANGELOG.md).
-- Commit messages and PR descriptions in English.
+- Commit messages, PR titles, and PR descriptions in English.
+
+## Commit messages and PR titles
+
+PRs are squash-merged, and the **PR title becomes the commit message on
+`main`**. PR titles must follow
+[Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/); a CI
+check (`pr-title`) enforces it. Commits inside your branch are squashed away,
+but following the same format there is appreciated.
+
+```
+<type>(<optional scope>): <subject>
+```
+
+| Type | Use for |
+| --- | --- |
+| `feat` | New behavior: a policy, an adapter, a CLI flag |
+| `fix` | Bug fixes, including wrong verdicts (missed attacks, overblocks) |
+| `docs` | Documentation only |
+| `test` | Tests or eval rows only |
+| `refactor` | Code change with no behavior change |
+| `perf` | Faster or lighter, same behavior |
+| `ci` | GitHub Actions workflows, labels, repo automation |
+| `build` | Packaging, dependencies, `pyproject.toml` |
+| `chore` | Release bumps and other maintenance |
+| `revert` | Reverting an earlier commit |
+
+Scopes are optional; use the area you touched: `policy`, `guard`, `adapter`,
+`server`, `cli`, `eval`, `deps`.
+
+- Subject in the imperative mood, starting lowercase, no trailing period,
+  ideally under 72 characters: `fix(policy): stop flagging timestamps as RRNs`,
+  not `Fixed RRN bug.`
+- Breaking changes (a verdict contract, CLI output, or config that users rely
+  on) get a `!` after the type or scope, e.g. `feat(server)!: return 403 on block`,
+  and a `BREAKING CHANGE:` line in the PR description.
+- Reference issues in the PR description (`Fixes #4`), not in the title.

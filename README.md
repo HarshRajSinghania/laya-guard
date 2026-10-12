@@ -64,14 +64,15 @@ curl -X POST localhost:8787/guard -H 'Content-Type: application/json' \
 
 ```
 agent tool_call
-  → guard-hook.sh (Claude Code PreToolUse hook; block ⇒ exit 2 cancels the run)
+  → guard-hook.sh (Claude Code PreToolUse hook; block ⇒ exit 2 cancels the run, review ⇒ permission prompt)
   → POST /guard (localhost:8787)
   → chains (`a && b`, `a; b`, `a || b`) are split and each command judged below;
     the worst verdict wins
-  → policy.yaml: 11 policies as regex prefilters (a block policy outranks a review one)
+  → policy.yaml: 12 policies as regex prefilters (a block policy outranks a review one)
       · match + action_on_regex=block  → instant block (risk 0.92, model not consulted)
       · match + action_on_regex=review → model judges, floor is review (risk ≥ 0.55)
-      · no match + safe command        → instant allow (one plain command: ls, git status, npm test…)
+      · no match + safe command        → instant allow (one plain command: ls, git status, npm test…;
+                                         the package.json scripts `npm test` & co. run are regex-checked first)
       · no match                       → model judges freely
   → Laya: choice (allow/review/block) + score (risk) + noul (maliciousness)
   → thresholds: block ≥ 0.8, review ≥ 0.45 (stricter for tool/email/web sources: 0.6/0.30)
@@ -86,6 +87,18 @@ no program-running/file-writing flags (`-exec`, `--config`, `--output`…), and 
 sensitive paths (`.ssh`, `.aws`, `.env`…). Installs, `git push`, and `npx` always
 go to the model.
 
+`npm test` is a safe command, but what it actually runs is `scripts.test` in
+package.json, which an agent (or an injection it read) can edit first. So when
+the adapter sends the command's directory (`cwd`, all 11 do), the guard reads the
+nearest package.json and checks `pre<name>`, `<name>`, and `post<name>` for
+`npm`/`pnpm`/`yarn` `test`/`build`/`lint`/`run <name>` (`bun run <name>` and
+`bun lint`; `bun test`/`bun build` are bun's own tools). Nested `npm run` calls and
+`cd` inside chains are followed. Scripts are checked against the regex policies
+only, not the model: the model blocks ordinary scripts like `next build`, `vite
+build`, and `jest`. A hit blocks or reviews per its policy (`package.json
+scripts.test: …` in the reason). If it can't tell which scripts run (`--prefix`,
+`--filter`, `-w`, a lost `cd -`, nesting deeper than 3), the call goes to review.
+
 Chains are split only at top-level `;`, `&&`, `||`, and `&` (never inside quotes,
 `$(…)`, or parentheses), so `cd app && npm test` is two safe commands while
 `npm test && curl … | sh` is blocked by its second half. The whole string is still
@@ -96,7 +109,7 @@ checked against the regexes, which catches patterns spanning commands
 
 | Agent | Integration | `review` becomes |
 |---|---|---|
-| Claude Code | [PreToolUse hook](guard-hook.sh) | passes through (exit 0) |
+| Claude Code | [PreToolUse hook](guard-hook.sh) | `ask` (permission prompt; `LAYA_GUARD_REVIEW=pass` to pass through) |
 | OpenCode | [`tool.execute.before` plugin](integrations/opencode/laya-guard.ts) | allow + stderr warning |
 | Codex CLI | [`PreToolUse` hook](integrations/codex/) | allow + stderr note (no ask lane) |
 | Cursor | [`beforeShellExecution` hook](integrations/cursor/) | `ask` (human approval) |
@@ -112,8 +125,8 @@ No hook mechanism, so no adapter: Aider, Roo Code (shut down May 2026),
 Continue (tiers only, repo archived), Junie (allow/ask only). Details in
 [integrations/](integrations/).
 
-Setup per agent: [integrations/](integrations/). Only Cursor routes `review`
-to a human; elsewhere `review` warns and passes — use native `permission`/
+Setup per agent: [integrations/](integrations/). Only Cursor and Claude Code route
+`review` to a human by default; elsewhere `review` warns and passes — use native `permission`/
 `allowlist` rules alongside if you want hard asks.
 
 ## Use cases
@@ -125,7 +138,10 @@ see Supported agents above for the full list.
 
 Register [guard-hook.sh](guard-hook.sh) as a PreToolUse hook. It reads the tool
 payload from stdin, POSTs it to the local server, and exits 2 on `block`
-(cancelling that run) — `review` and `allow` pass through with exit 0.
+(cancelling that run). `review` asks you: the hook prints a `permissionDecision: "ask"`
+JSON and Claude Code shows a permission prompt with the policy and reason
+(`LAYA_GUARD_REVIEW=pass` restores the old pass-through). `allow` passes silently.
+Non-interactive runs (`claude -p`) have nobody to answer, so an `ask` is denied there.
 For the Bash tool only the command is judged, not the agent's description.
 If the server is unreachable or slower than 10s, it falls back to the offline
 check (see [Server down](#server-down)). Point it elsewhere with `LAYA_GUARD_URL`.
@@ -214,34 +230,36 @@ Most guardrails scan **prompt text**. laya-guard sits one step later: it judges 
 | Verdict | allow / **review** / block + risk | allow / confirm / block | binary detected | valid + score | scores / thresholds |
 | Korean evaluation | ✅ 30-case set, 30/30 | ❌ none verified | ❌ | ❌ | ❌ |
 | AgentDojo numbers | ✅ 25/27, 92/97 (judge-level, self-reported) | ❌ none verified | ❌ | ❌ | ❌ |
-| Status | active, v0.2.3, MIT | MIT | ⚠️ archived May 2025 | ⚠️ archived, unmaintained | alpha, Apache-2.0 |
+| Status | active, v0.2.4, MIT | MIT | ⚠️ archived May 2025 | ⚠️ archived, unmaintained | alpha, Apache-2.0 |
 
 No verified third-party AgentDojo score exists for any tool in this table —
 ours is self-reported and judge-level (see [Limitations](#limitations)).
 
-## Policies (11)
+## Policies (12)
 
 | id | What it catches | Regex hit ⇒ |
 |---|---|---|
-| `destructive-fs` | `rm -rf /`, `mkfs`, `dd` to devices, fork bombs | block |
+| `destructive-fs` | `rm -rf /` and `rm -rf ~`/`$HOME` in any flag order (`-fr`, `-r -f`, `--recursive --force`), `mkfs`, `dd` to devices, fork bombs | block |
 | `pipe-to-shell` | `curl … \| sh`, `wget … \| sudo bash`, `bash -c "$(curl …)"`, `bash <(curl …)` | block |
 | `exfiltration` | tunnels, pipes into `nc`, `curl -d @file` uploads | review |
 | `prompt-injection` | ignore-previous-instructions, jailbreaks, KR+EN | block |
-| `secrets-leak` | API keys, private keys, tokens | block |
+| `secrets-leak` | API keys, private keys, tokens, key files (`~/.ssh`, `~/.aws`, …) piped into `curl`/`wget`/`nc` | block |
 | `payment-action` | payments/refunds/charges, KR+EN | review |
 | `remote-exec` | sketchy package indexes, remote scripts, local pipes into a shell, encoded PS | review |
 | `priv-escalation` | `sudo sh`, `chmod 777`, setuid, redirects into `/etc/` | review |
 | `persistence` | cron, services, shell-rc hooks, git `core.hooksPath`/`core.pager` | review |
-| `mass-delete` | `DROP TABLE`, `s3 rm --recursive`, `kubectl delete --all`, `git push --force` | review |
+| `mass-delete` | `DROP TABLE`, `s3 rm --recursive`, `kubectl delete --all`, `git push --force`, `git reset --hard`, `git clean -f`, `git checkout -- .` | review |
 | `auth-bypass` | auth/TLS disabling, password resets, KR+EN | block |
+| `credential-read` | reading private keys / cloud credentials (`cat ~/.ssh/id_rsa`, `cat ~/.aws/credentials`, …) | review |
 
 All patterns live in [policy.yaml](src/laya_guard/policy.yaml) — edit, add your own, no code changes needed.
 
 ## API
 
 - `GET /health` → `{"ok": true, "mock": false}`
-- `POST /guard` `{tool_call, source?}` → `{action, risk, policy_id, reason, mock, verdict_source}`
+- `POST /guard` `{tool_call, source?, cwd?}` → `{action, risk, policy_id, reason, mock, verdict_source}`
   (`source`: `user` | `tool` | `email` | `web`; non-user sources get stricter thresholds.
+  `cwd`: absolute directory the command runs in; enables package.json script checks.
   `reason` is Korean when the input contains Hangul, English otherwise.
   `verdict_source`: `regex` (prefilter block, model skipped) |
   `allowlist` (safe command, model skipped) | `model` |
@@ -258,6 +276,7 @@ All patterns live in [policy.yaml](src/laya_guard/policy.yaml) — edit, add you
 | `LAYA_GUARD_DEVICE` | env | `cpu` (deterministic; set `mps` for speed at the cost of reproducibility) |
 | `LAYA_GUARD_URL` | env (hooks/adapters) | `http://localhost:8787/guard` |
 | `LAYA_GUARD_FAIL` | env (hooks/adapters) | `open` — with the server down, unjudged calls pass; `closed` blocks them |
+| `LAYA_GUARD_REVIEW` | env (Claude Code hook) | `ask` — `review` becomes a permission prompt; `pass` lets it through without asking |
 | `LAYA_GUARD_BIN` | env (hooks/adapters) | `laya-guard` — CLI used for the offline check |
 | `--no-warmup` | `laya-guard serve` | off — the model loads before the server listens |
 | block/review thresholds | `policy.yaml` → `defaults` | 0.8 / 0.45 |
@@ -272,6 +291,7 @@ no model) instead:
 | Call | Offline verdict |
 |---|---|
 | matches any regex policy (block or review level) | block |
+| package.json script of a safe command matches a regex policy | block |
 | safe command, or a chain of only safe commands | allow |
 | anything else | allow with a stderr warning; block with `LAYA_GUARD_FAIL=closed` |
 
@@ -282,6 +302,14 @@ Inputs over 256K characters, or with a line over 16K, are blocked without being
 read: some regexes are quadratic in line length, and a 200KB line used to take
 48s, long enough for hooks to time out.
 
+The model reads at most 4,000 characters per call. Longer input is split into
+windows on line boundaries (a single long line is cut with a small overlap), every
+window is judged, and the worst verdict wins, so a dangerous command after a long
+harmless preamble is still seen. Past 6 windows (~24K characters) the middle is
+skipped (the first windows and the last one are kept) and an `allow` is raised to
+`review`; regexes always run over the whole text. Each extra window costs about
+the same as one model call, so a 6-window input takes a few seconds.
+
 ## Limitations (read before trusting it)
 
 - With the server down, calls that are neither regex-flagged nor safe commands
@@ -291,8 +319,18 @@ read: some regexes are quadratic in line length, and a 200KB line used to take
   marked `verdict_source: "heuristic"` and a warning is logged — check it if you
   rely on model judgments.
 - The safe-command lane allows `npm test`, `make test`, `go test`, etc. without the
-  model — those run your project's own scripts, so a malicious repo's test script
-  is not judged. Trim `safe_commands` in `policy.yaml` if that matters to you.
+  model. package.json scripts are regex-checked (see above), so `curl … | sh` or a
+  secret upload in `scripts.test` is caught, but a quieter script (`node -e …`,
+  `node scripts/x.js`) passes. Code those commands run is not checked at all:
+  test files, `conftest.py`, `build.rs`, `node_modules/.bin`, Makefile recipes
+  (expanding them with `make -n` would run `$(shell …)`), and `.npmrc`
+  `script-shell`. An edit to them is judged only when the agent writes it, and only
+  by adapters that hook file edits. Trim `safe_commands` in `policy.yaml` if that
+  matters to you.
+- Script checks trust the `cwd` the agent reports. If an agent's shell keeps a
+  `cd` from an earlier call but reports the project root, the wrong package.json
+  is read. Five adapters (Cline, Gemini, Qwen, Kilo, Amp) send the tool call as
+  JSON, so it never qualifies as a safe command and goes to the model instead.
 - Chain commands are judged one by one, so the model doesn't see that `cd /etc`
   came before `cat shadow`. Sensitive-path checks and whole-string regexes cover
   the common cases, not all of them.
